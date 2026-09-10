@@ -1,0 +1,34 @@
+{
+  "arm": "right",
+  "controller": "sim",
+  "created": "2026-09-10T11:44:03",
+  "poseset": "仿真测试1",
+  "opts": {
+    "bidirectional": true,
+    "approach_delta_rad": 0.06,
+    "dwell_s": 0.6,
+    "avg_frames": 25,
+    "return_home": true
+  },
+  "payload_during_measure": {
+    "mass_kg": 0.0,
+    "com_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "alpha": 1.0
+  },
+  "sim_truth": {
+    "payload_mass": 1.2,
+    "payload_com": [
+      0.1,
+      0.0,
+      0.1
+    ],
+    "arm_mass_scale": 1.04,
+    "friction_scale": 1.0,
+    "tau_noise": 0.03,
+    "q_noise": 5e-05
+  }
+}

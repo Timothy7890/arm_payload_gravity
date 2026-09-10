@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>末端负载辨识 · 重力前馈补偿 · 到位验证</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>末端负载 / 重力前馈 <span id="mode-badge" class="badge sim">仿真</span></h1>
+  <div class="group">
+    <span class="title">模式</span>
+    <select id="mode-select"><option value="sim">仿真</option><option value="real">真机</option></select>
+    <span class="title">手臂</span>
+    <select id="arm-select"><option value="right">右臂</option><option value="left">左臂</option></select>
+    <button id="btn-switch">切换</button>
+  </div>
+  <div class="group">
+    <button id="btn-engage" class="primary">接管</button>
+    <button id="btn-release">释放</button>
+    <button id="btn-hold" class="danger">急停(保持)</button>
+    <span id="engage-state" class="meta"></span>
+  </div>
+  <span id="armsdk" class="meta" title="只读监听 rt/arm_sdk：接管前有消息 = 别人在控臂"></span>
+  <span id="mode-error" class="err-inline"></span>
+  <span id="pill" class="pill">—</span>
+</header>
+
+<main>
+  <section id="left">
+    <div id="viewer">
+      <canvas id="scene3d"></canvas>
+      <div class="hint">拖动旋转 · 滚轮缩放 · 右键/Shift 拖动平移 · 双击复位 &nbsp;|&nbsp; 白=实测 · 灰虚=指令 · 蓝虚=期望 · 品红=补偿质心 · 黄=仿真真值质心 · 绿点=姿态集手腕</div>
+    </div>
+    <div id="msg"></div>
+    <h2>关节（实测 / 指令 / 偏差 / 电机力矩估计 / 前馈）</h2>
+    <table id="joints-table"><tbody></tbody></table>
+    <div id="payload-now" class="meta"></div>
+  </section>
+
+  <aside>
+    <div class="panel" id="panel-sim">
+      <h2>仿真真值（控制器不知道这些）</h2>
+      <div class="row">
+        <label>负载 kg <input id="tr-mass" type="number" step="0.05" value="1.2"></label>
+        <label>质心 x <input id="tr-cx" type="number" step="0.01" value="0.10"></label>
+        <label>y <input id="tr-cy" type="number" step="0.01" value="0.00"></label>
+        <label>z <input id="tr-cz" type="number" step="0.01" value="-0.02"></label>
+      </div>
+      <div class="row">
+        <label>臂质量比例 <input id="tr-scale" type="number" step="0.01" value="1.04"></label>
+        <label>摩擦比例 <input id="tr-fric" type="number" step="0.1" value="1.0"></label>
+        <label><input id="tr-foreign" type="checkbox"> 模拟他人占用 rt/arm_sdk</label>
+        <button id="btn-truth">写入真值</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>1 · 姿态集 <span id="poses-meta" class="meta"></span></h2>
+      <div class="row">
+        <label>当前 <select id="poseset-select"></select></label>
+        <button id="btn-set-delete" title="删除当前姿态集">删除</button>
+        <input id="new-set-name" placeholder="新姿态集名（如 夹爪1.2kg）" style="width:170px">
+        <input id="new-set-note" placeholder="备注（末端装了什么）" style="width:150px">
+        <button id="btn-set-create" class="primary">新建</button>
+      </div>
+      <div class="row">
+        <label>速度 <input id="speed" type="number" step="0.05" value="0.15" min="0.05" max="0.3"> rad/s</label>
+        <button id="btn-speed">设</button>
+        <span class="spacer"></span>
+        <label>自动生成 n <input id="gen-n" type="number" value="12" min="4" max="30"></label>
+        <label>seed <input id="gen-seed" type="number" value="1"></label>
+        <button id="btn-gen">生成为新姿态集</button>
+      </div>
+      <div id="pose-chips"></div>
+      <div class="meta">点姿态名 = 单独走到该姿态（确认无碰撞，不测量）；右键 = 从姿态集删除。</div>
+    </div>
+
+    <div class="panel" id="panel-teach">
+      <h2>1b · 示教：手推记姿态 <span id="teach-state" class="meta"></span></h2>
+      <div class="row">
+        <button id="btn-teach-start" class="primary">开始示教（卸力）</button>
+        <button id="btn-teach-toggle" disabled>空格：锁定并记录 / 继续拖动</button>
+        <button id="btn-teach-end" disabled>结束示教（保持）</button>
+        <button id="btn-add-current" title="不卸力，直接把当前实测角追加进姿态集">记录当前姿态</button>
+      </div>
+      <div class="meta">流程：接管 → 开始示教（手臂卸力，⚠ 真机要扶住）→ 手推到想要的位置 → 按<kbd>空格</kbd>锁定，静止后自动读取并追加到当前姿态集 → 再按<kbd>空格</kbd>恢复卸力推下一个 → 结束示教。</div>
+      <div class="row" title="锁定后要在窗口内满足 max|dq| < 速度阈 且 位置漂移 < 漂移阈 才算静止；超时则按均值照常记录并标注实测值">
+        <span class="meta">静止判定：</span>
+        <label>速度阈 <input id="ts-dq" type="number" step="0.005" min="0.001"> rad/s</label>
+        <label>漂移阈 <input id="ts-drift" type="number" step="0.001" min="0.0005"> rad</label>
+        <label>窗口 <input id="ts-win" type="number" step="0.1" min="0.1"> s</label>
+        <label>超时 <input id="ts-to" type="number" step="0.5" min="0.5"> s</label>
+        <button id="btn-teach-still">应用阈值</button>
+        <span id="teach-still-last" class="meta"></span>
+      </div>
+      <div id="teach-sim" class="hidden">
+        <div class="meta">仿真没有手：用滑块"推"手臂（仅示教卸力状态下有效）</div>
+        <div class="row" id="teach-sliders"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>2 · 负载测量</h2>
+      <div class="row">
+        <label><input id="m-bidir" type="checkbox" checked> 双向逼近（抵消摩擦）</label>
+        <label>静置 s <input id="m-dwell" type="number" step="0.1" value="0.6"></label>
+        <label>均值帧 <input id="m-frames" type="number" value="25"></label>
+      </div>
+      <div class="row">
+        <button id="btn-measure" class="primary">开始测量</button>
+        <button id="btn-task-stop" class="danger">停止任务</button>
+        <span id="task-phase" class="meta"></span>
+      </div>
+      <div id="measure-progress" class="meta"></div>
+      <table id="samples-table" class="small"><tbody></tbody></table>
+    </div>
+
+    <div class="panel">
+      <h2>3 · 求解 → 应用到前馈</h2>
+      <div class="row">
+        <label>会话 <select id="session-select"></select></label>
+        <label>力矩源 <select id="solve-source"><option value="pd">PD 重构（推荐）</option><option value="est">tau_est</option></select></label>
+        <label><input id="solve-alpha" type="checkbox" checked> 同时拟合臂自重比例 α</label>
+        <button id="btn-solve" class="primary">求解</button>
+      </div>
+      <div id="solve-result"></div>
+      <div class="row">
+        <label>m <input id="ap-mass" type="number" step="0.01"></label>
+        <label>cx <input id="ap-cx" type="number" step="0.001"></label>
+        <label>cy <input id="ap-cy" type="number" step="0.001"></label>
+        <label>cz <input id="ap-cz" type="number" step="0.001"></label>
+        <label>α <input id="ap-alpha" type="number" step="0.01" value="1.0"></label>
+      </div>
+      <div class="row">
+        <button id="btn-apply" class="primary">应用并保存</button>
+        <button id="btn-apply-saved">应用已保存的</button>
+        <button id="btn-clear">清除（回到作者现状）</button>
+      </div>
+      <div id="payload-saved" class="meta"></div>
+    </div>
+
+    <div class="panel">
+      <h2>4 · 到位验证（同一姿态集，三方案对比）</h2>
+      <div class="row">
+        <label><input class="v-mode" type="checkbox" value="baseline" checked> 基线（现状）</label>
+        <label><input class="v-mode" type="checkbox" value="payload" checked> 负载补偿</label>
+        <label><input class="v-mode" type="checkbox" value="payload_correct" checked> 补偿+修正</label>
+        <label>修正次数 <input id="v-iters" type="number" value="2" min="1" max="5"></label>
+      </div>
+      <div class="row">
+        <label>只用前 <input id="v-npose" type="number" value="0" min="0"> 个姿态（0=全部）</label>
+        <button id="btn-validate" class="primary">开始验证</button>
+        <label>历史 <select id="validation-select"></select></label>
+      </div>
+      <div id="validate-summary"></div>
+      <table id="validate-table" class="small"><tbody></tbody></table>
+    </div>
+
+    <div class="panel">
+      <h2>5 · 单点到位测试</h2>
+      <div class="row" id="goto-inputs"></div>
+      <div class="row">
+        <button id="btn-goto-meas">填当前实测</button>
+        <button id="btn-goto-home">填 home</button>
+        <label>修正次数 <input id="g-iters" type="number" value="0" min="0" max="5"></label>
+        <button id="btn-goto" class="primary">出发</button>
+      </div>
+      <div id="goto-result" class="meta"></div>
+    </div>
+
+    <div class="panel">
+      <h2>日志</h2>
+      <div id="task-log"></div>
+    </div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
