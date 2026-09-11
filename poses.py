@@ -154,6 +154,69 @@ def update_set(name: str, patch: Dict) -> Dict:
     return d
 
 
+# ---------------------------------------------------------------- 左右镜像
+# H2 左右臂关于 y=0 面镜像：绕 y 轴的关节（肩 pitch、肘、腕 pitch）符号不变，
+# 绕 x/z 轴的关节（肩 roll、肩 yaw、腕 roll、腕 yaw）取反。URDF 限位也正好对应（右肩 roll [-2.49,0.52] ↔ 左 [-0.52,2.49]）。
+MIRROR_SIGN = np.array([1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+
+
+def mirror_q(q) -> List[float]:
+    return [round(float(v), 5) + 0.0 for v in np.asarray(q, float).reshape(7) * MIRROR_SIGN]   # +0.0 去掉 -0.0
+
+
+def _load_any(src: str) -> Dict:
+    """src 可以是姿态集名字，也可以是任意路径的 .json 文件。"""
+    p = Path(src).expanduser()
+    if p.suffix == ".json" and p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return load_set(src)
+
+
+def mirror_set(src: str, name: Optional[str] = None, note: str = "", out: Optional[str] = None,
+               force: bool = False) -> Path:
+    """把一个姿态集镜像到另一条手臂。
+
+    src   源姿态集（名字或 .json 路径）；name 新名字（默认 <源名>_<左|右>）；
+    out   输出目录或 .json 文件路径（默认 config/posesets/）。
+    只镜像姿态与 home_q，不镜像负载参数（左右末端/电机/摩擦各不相同，左臂要重新测量求解）。
+    """
+    d = _load_any(src)
+    src_arm = d.get("arm")
+    if src_arm not in HOME_Q:
+        raise ValueError(f"源姿态集 arm 字段无效：{src_arm!r}")
+    dst_arm = "left" if src_arm == "right" else "right"
+    grav = ArmGravity(dst_arm)
+    lo, hi = grav.limits[:, 0], grav.limits[:, 1]
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    poses = []
+    for p in d.get("poses", []):
+        q = np.asarray(mirror_q(p["q"]), float)
+        bad = np.where((q < lo - 1e-6) | (q > hi + 1e-6))[0]
+        if len(bad):
+            raise ValueError(f"姿态 {p.get('name')} 镜像后超出 {dst_arm} 臂限位（关节 {bad.tolist()}）")
+        poses.append({"name": p.get("name", f"p{len(poses):02d}"), "q": q.round(5).tolist(),
+                      "tip_xyz": [round(float(v), 4) for v in grav.tip_T(q)[:3, 3]],
+                      "recorded_at": now, "source": f"mirror:{p.get('source', '?')}"})
+    new_name = _check_name(name or f"{d.get('name', 'set')}_{'左' if dst_arm == 'left' else '右'}")
+    out_d = {"name": new_name, "arm": dst_arm,
+             "note": note or f"由 {src_arm} 臂姿态集「{d.get('name')}」镜像而来。" + (f" {d['note']}" if d.get("note") else ""),
+             "created": now, "mirrored_from": {"name": d.get("name"), "arm": src_arm, "path": str(src)},
+             "home_q": mirror_q(d.get("home_q", HOME_Q[src_arm])), "motion": dict(d.get("motion") or DEFAULT_MOTION),
+             "poses": poses}
+    out_d["regressor_cond"] = round(condition_number(dst_arm, [p["q"] for p in poses]), 2) if len(poses) >= 2 else None
+    out_d["updated"] = now
+    if out:
+        op = Path(out).expanduser()
+        path = op if op.suffix == ".json" else op / f"{new_name}.json"
+    else:
+        path = set_path(new_name)
+    if path.exists() and not force:
+        raise FileExistsError(f"{path} 已存在，加 --force 覆盖")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out_d, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 def condition_number(arm: str, qs: List) -> float:
     grav = ArmGravity(arm)
     Y = np.vstack([grav.payload_regressor(np.asarray(q, float)) for q in qs])
@@ -226,8 +289,20 @@ def main() -> int:
     g.add_argument("--name", default=None); g.add_argument("--force", action="store_true")
     sub.add_parser("list")
     s = sub.add_parser("show"); s.add_argument("name")
+    m = sub.add_parser("mirror", help="把姿态集镜像到另一条手臂（右↔左）")
+    m.add_argument("src", help="源姿态集名字，或 .json 文件路径")
+    m.add_argument("--name", default=None, help="新姿态集名字（默认 <源名>_左/右）")
+    m.add_argument("--out", default=None, help="输出目录或 .json 路径（默认 config/posesets/）")
+    m.add_argument("--note", default=""); m.add_argument("--force", action="store_true")
     a = ap.parse_args()
-    if a.cmd == "gen":
+    if a.cmd == "mirror":
+        try:
+            path = mirror_set(a.src, a.name, a.note, a.out, a.force)
+        except (FileExistsError, FileNotFoundError, ValueError) as e:
+            raise SystemExit(f"[mirror] {e}")
+        d = json.loads(path.read_text(encoding="utf-8"))
+        print(f"[mirror] {d['mirrored_from']['arm']} → {d['arm']}，{len(d['poses'])} 个姿态 → {path}，条件数 {d['regressor_cond']}")
+    elif a.cmd == "gen":
         d = generate(a.arm, a.n, a.seed, name=a.name)
         if set_path(d["name"]).exists() and not a.force:
             raise SystemExit(f"{set_path(d['name'])} 已存在，加 --force 覆盖")
